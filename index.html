@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Reddit Comments">
+    <meta name="theme-color" content="#0ea5e9">
+    <title>Reddit Post Comments - 50 Random</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .animate-spin { animation: spin 1s linear infinite; }
+        .line-clamp-2 {
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-sky-100 via-white to-blue-100 min-h-screen">
+    <div id="app" class="flex items-center justify-center p-4 min-h-screen"></div>
+
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+    <script>
+        const { createElement: h, useState, useEffect, useRef } = React;
+
+        // Detect Reddit short/share links like /s/XXXXXX
+        function isShortLink(rawUrl) {
+            try {
+                const url = new URL(rawUrl.trim());
+                return /^\/r\/[^/]+\/s\//.test(url.pathname) || /^\/s\//.test(url.pathname);
+            } catch { return false; }
+        }
+
+        // Resolve a short/share link to the real permalink by following the redirect
+        async function resolveShortLink(rawUrl) {
+            try {
+                // Fetch with redirect:follow — response.url will be the final URL
+                const resp = await fetch(rawUrl.trim(), {
+                    method: 'GET',
+                    redirect: 'follow',
+                    headers: { 'User-Agent': 'Mozilla/5.0' }
+                });
+                const finalUrl = resp.url;
+                // finalUrl should now look like https://www.reddit.com/r/sub/comments/id/slug/
+                if (finalUrl && finalUrl.includes('/comments/')) {
+                    return finalUrl;
+                }
+                // Fallback: parse the HTML for a canonical link
+                const html = await resp.text();
+                const match = html.match(/canonical[^>]+href="([^"]+\/comments\/[^"]+)"/);
+                if (match) return match[1];
+                return null;
+            } catch {
+                return null;
+            }
+        }
+
+        // Convert a resolved Reddit URL to its .json API URL
+        function toJsonUrl(rawUrl) {
+            try {
+                const url = new URL(rawUrl.trim());
+                let path = url.pathname.replace(/\/?$/, '');
+                return `https://www.reddit.com${path}.json?limit=500&depth=10&raw_json=1`;
+            } catch {
+                return null;
+            }
+        }
+
+        // Extract subreddit + post title slug from URL for display
+        function parsePostMeta(rawUrl) {
+            try {
+                const url = new URL(rawUrl.trim());
+                const parts = url.pathname.split('/').filter(Boolean);
+                const sub = parts[1] || '?';
+                const slug = (parts[4] || parts[3] || 'post').replace(/_/g, ' ');
+                return { sub, slug };
+            } catch {
+                return { sub: '?', slug: rawUrl };
+            }
+        }
+
+        // Recursively walk comment tree and collect all valid comments
+        function getAllComments(items) {
+            let all = [];
+            const walk = (list, depth = 0) => {
+                if (!Array.isArray(list)) return;
+                for (let item of list) {
+                    if (!item || !item.data) continue;
+                    if (
+                        item.kind === 't1' &&
+                        item.data?.body &&
+                        item.data.body !== '[deleted]' &&
+                        item.data.body !== '[removed]' &&
+                        item.data.author !== '[deleted]' &&
+                        item.data.body.length > 10
+                    ) {
+                        all.push({ ...item, depth });
+                    }
+                    if (item.data?.replies?.data?.children) {
+                        walk(item.data.replies.data.children, depth + 1);
+                    }
+                }
+            };
+            walk(items);
+            return all;
+        }
+
+        function App() {
+            const savedLinks = () => {
+                try { return JSON.parse(localStorage.getItem('postLinks') || '[]'); } catch { return []; }
+            };
+
+            const [links, setLinks] = useState(savedLinks().join('\n'));
+            const [phoneNumber, setPhoneNumber] = useState(localStorage.getItem('phoneNumber') || '');
+            const [comments, setComments] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [status, setStatus] = useState('');
+            const [error, setError] = useState('');
+            const [showSettings, setShowSettings] = useState(savedLinks().length === 0);
+            const [postStats, setPostStats] = useState([]);
+
+            const parseLinks = (raw) =>
+                raw.split(/[\n,]+/)
+                   .map(l => l.trim())
+                   .filter(l => l.length > 0 && (l.includes('reddit.com') || l.includes('redd.it')));
+
+            const fetchComments = async (rawLinks) => {
+                // Allow short links through — they'll be resolved below
+                const urlList = rawLinks.map(r => ({ raw: r, json: toJsonUrl(r), meta: parsePostMeta(r) }));
+
+                if (urlList.length === 0) {
+                    setError('No valid Reddit post links found.');
+                    return;
+                }
+
+                setLoading(true);
+                setError('');
+                setStatus(`Resolving ${urlList.length} link${urlList.length > 1 ? 's' : ''}...`);
+                setComments([]);
+                setPostStats([]);
+
+                // Resolve short/share links (e.g. /r/sub/s/XXXX) to full permalinks
+                for (let i = 0; i < urlList.length; i++) {
+                    if (isShortLink(urlList[i].raw)) {
+                        setStatus(`Resolving short link ${i + 1}/${urlList.length}...`);
+                        const resolved = await resolveShortLink(urlList[i].raw);
+                        if (resolved) {
+                            urlList[i].raw  = resolved;
+                            urlList[i].json = toJsonUrl(resolved);
+                            urlList[i].meta = parsePostMeta(resolved);
+                        } else {
+                            urlList[i].json = null;
+                        }
+                    }
+                }
+
+                const validList = urlList.filter(u => u.json !== null);
+                if (validList.length === 0) {
+                    setError('Could not resolve any links. Try using full Reddit post URLs.');
+                    setLoading(false);
+                    return;
+                }
+
+                setStatus(`Fetching comments from ${validList.length} post${validList.length > 1 ? 's' : ''}...`);
+
+                const pool = []; // { comment, postTitle, postUrl, postDate, yearsAgo, sub }
+                const stats = [];
+
+                for (let i = 0; i < validList.length; i++) {
+                    const { raw, json, meta } = validList[i];
+                    setStatus(`Fetching post ${i + 1}/${validList.length}: r/${meta.sub}…`);
+                    try {
+                        const resp = await fetch(json, {
+                            headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+                        });
+
+                        if (!resp.ok) {
+                            stats.push({ url: raw, sub: meta.sub, slug: meta.slug, count: 0, error: `HTTP ${resp.status}` });
+                            continue;
+                        }
+
+                        const data = await resp.json();
+
+                        // data[0] = post info, data[1] = comments
+                        const postData = data[0]?.data?.children?.[0]?.data || {};
+                        const postTitle = postData.title || meta.slug;
+                        const postUrl   = postData.permalink
+                            ? `https://www.reddit.com${postData.permalink}`
+                            : raw;
+                        const postDate  = postData.created_utc
+                            ? new Date(postData.created_utc * 1000)
+                            : new Date();
+                        const yearsAgo  = ((Date.now() - postDate) / (365.25 * 24 * 60 * 60 * 1000)).toFixed(1);
+                        const postDateStr = postDate.toLocaleDateString('en-US', {
+                            year: 'numeric', month: 'short', day: 'numeric'
+                        });
+
+                        const rawComments = getAllComments(data[1]?.data?.children || []);
+
+                        rawComments.forEach(c => {
+                            pool.push({
+                                body:      c.data.body,
+                                author:    c.data.author,
+                                score:     c.data.score,
+                                postTitle,
+                                postUrl,
+                                postDate:  postDateStr,
+                                yearsAgo,
+                                sub:       meta.sub,
+                                depth:     c.depth || 0
+                            });
+                        });
+
+                        stats.push({ url: raw, sub: meta.sub, slug: postTitle, count: rawComments.length, error: null });
+
+                    } catch (err) {
+                        stats.push({ url: raw, sub: meta.sub, slug: meta.slug, count: 0, error: err.message });
+                    }
+
+                    await new Promise(r => setTimeout(r, 200));
+                }
+
+                setPostStats(stats);
+
+                if (pool.length === 0) {
+                    setError('No comments found across any of the provided posts.');
+                    setLoading(false);
+                    setStatus('');
+                    return;
+                }
+
+                // Shuffle pool and pick up to 50
+                const shuffled = pool.sort(() => Math.random() - 0.5);
+                const picked = shuffled.slice(0, 50);
+
+                setStatus('');
+                setComments(picked);
+                setLoading(false);
+            };
+
+            const handleStart = () => {
+                const parsed = parseLinks(links);
+                if (parsed.length === 0) return;
+                localStorage.setItem('postLinks', JSON.stringify(parsed));
+                if (phoneNumber.trim()) {
+                    localStorage.setItem('phoneNumber', phoneNumber.trim().replace(/[^0-9]/g, ''));
+                }
+                setShowSettings(false);
+                fetchComments(parsed);
+            };
+
+            const handleShuffle = () => {
+                const parsed = parseLinks(links);
+                fetchComments(parsed);
+            };
+
+            const sendToWhatsApp = (comment) => {
+                const msg = `🎲 Reddit r/${comment.sub} (${comment.yearsAgo}y ago)\n\n"${comment.postTitle}"\n${comment.postDate}\n\n"${comment.body}"\n\n— u/${comment.author} (↑${comment.score})\n\n${comment.postUrl}`;
+                const phone = localStorage.getItem('phoneNumber') || '';
+                const url = phone
+                    ? `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`
+                    : `https://wa.me/?text=${encodeURIComponent(msg)}`;
+                window.open(url, '_blank');
+            };
+
+            // ── SETTINGS SCREEN ──────────────────────────────────────────────
+            if (showSettings) {
+                return h('div', { className: 'w-full max-w-2xl' },
+                    h('div', { className: 'text-center mb-4' },
+                        h('div', { className: 'flex items-center justify-center gap-2 mb-1' },
+                            h('span', { className: 'text-3xl' }, '🎯'),
+                            h('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Reddit Post Comments')
+                        ),
+                        h('p', { className: 'text-xs text-gray-500' }, 'Paste links → get 50 random comments')
+                    ),
+                    h('div', { className: 'bg-white rounded-2xl shadow-xl p-6 border' },
+                        h('h2', { className: 'text-lg font-bold mb-3' }, '⚙️ Setup'),
+                        h('div', { className: 'space-y-4' },
+
+                            h('div', null,
+                                h('label', { className: 'block text-sm font-bold mb-2' },
+                                    '🔗 Reddit Post Links',
+                                    h('span', { className: 'font-normal text-gray-400 ml-1' }, '(one per line or comma-separated)')
+                                ),
+                                h('textarea', {
+                                    rows: 8,
+                                    value: links,
+                                    onChange: (e) => setLinks(e.target.value),
+                                    placeholder: 'https://www.reddit.com/r/AskReddit/comments/abc123/...\nhttps://www.reddit.com/r/worldnews/comments/xyz789/...',
+                                    className: 'w-full px-4 py-3 border-2 rounded-xl focus:ring-2 focus:ring-sky-500 outline-none text-sm font-mono resize-none',
+                                    autoFocus: true
+                                }),
+                                h('p', { className: 'text-xs text-gray-400 mt-1' },
+                                    '💡 Paste any number of Reddit post URLs. Comments are pooled & 50 are picked randomly.'
+                                )
+                            ),
+
+                            h('div', null,
+                                h('label', { className: 'block text-sm font-bold mb-2' }, '📱 WhatsApp Number (Optional)'),
+                                h('input', {
+                                    type: 'tel',
+                                    value: phoneNumber,
+                                    onChange: (e) => setPhoneNumber(e.target.value),
+                                    placeholder: '911234567890',
+                                    className: 'w-full px-4 py-3 border-2 rounded-xl focus:ring-2 focus:ring-sky-500 outline-none'
+                                })
+                            ),
+
+                            h('button', {
+                                onClick: handleStart,
+                                disabled: parseLinks(links).length === 0,
+                                className: 'w-full bg-gradient-to-r from-sky-500 to-blue-500 text-white py-3 rounded-xl font-bold hover:from-sky-600 hover:to-blue-600 disabled:opacity-40 transition'
+                            }, `🎯 Fetch Comments from ${parseLinks(links).length || '?'} Post${parseLinks(links).length !== 1 ? 's' : ''}`)
+                        )
+                    )
+                );
+            }
+
+            // ── MAIN SCREEN ───────────────────────────────────────────────────
+            return h('div', { className: 'w-full max-w-2xl' },
+
+                // Header
+                h('div', { className: 'text-center mb-3' },
+                    h('div', { className: 'flex items-center justify-center gap-2 mb-1' },
+                        h('span', { className: 'text-3xl' }, '🎯'),
+                        h('h1', { className: 'text-2xl font-bold text-gray-800' }, 'Reddit Post Comments')
+                    ),
+                    h('p', { className: 'text-xs text-gray-500' },
+                        `${parseLinks(links).length} post${parseLinks(links).length !== 1 ? 's' : ''} • up to 50 random comments`
+                    )
+                ),
+
+                // Loading
+                loading ? h('div', { className: 'bg-white rounded-xl shadow-xl p-10 text-center' },
+                    h('div', { className: 'text-5xl mb-4 animate-spin' }, '🎯'),
+                    h('p', { className: 'font-bold mb-2' }, 'Fetching Comments…'),
+                    h('p', { className: 'text-sm text-sky-600' }, status)
+                ) :
+
+                // Error
+                error ? h('div', { className: 'bg-sky-50 border-2 border-sky-300 rounded-xl p-6' },
+                    h('div', { className: 'text-3xl text-center mb-2' }, '⚠️'),
+                    h('p', { className: 'text-sky-700 font-bold text-center mb-4' }, error),
+                    h('div', { className: 'flex gap-2' },
+                        h('button', {
+                            onClick: handleShuffle,
+                            className: 'flex-1 py-2 bg-sky-600 text-white rounded-xl hover:bg-sky-700 font-bold text-sm'
+                        }, '🔄 Retry'),
+                        h('button', {
+                            onClick: () => setShowSettings(true),
+                            className: 'px-5 bg-gray-100 py-2 rounded-xl hover:bg-gray-200 font-bold text-sm'
+                        }, '⚙️')
+                    )
+                ) :
+
+                // Comments list
+                comments.length > 0 ? h('div', null,
+
+                    // Post stats summary
+                    postStats.length > 0 && h('div', { className: 'bg-white rounded-xl shadow p-3 mb-3 border' },
+                        h('p', { className: 'text-xs font-bold text-gray-600 mb-2' }, '📊 Posts fetched:'),
+                        h('div', { className: 'space-y-1' },
+                            postStats.map((s, i) =>
+                                h('div', { key: i, className: 'flex items-center justify-between text-xs' },
+                                    h('span', { className: 'text-gray-600 truncate mr-2 max-w-xs', title: s.slug }, `r/${s.sub} — ${s.slug}`),
+                                    s.error
+                                        ? h('span', { className: 'text-red-500 shrink-0' }, `❌ ${s.error}`)
+                                        : h('span', { className: 'text-green-600 font-bold shrink-0' }, `${s.count} comments`)
+                                )
+                            )
+                        )
+                    ),
+
+                    // Comment cards
+                    h('div', { className: 'grid gap-2 mb-3 max-h-[65vh] overflow-y-auto' },
+                        comments.map((comment, idx) =>
+                            h('div', {
+                                key: idx,
+                                className: 'bg-white rounded-lg shadow p-3 border'
+                            },
+                                h('div', { className: 'flex justify-between items-start mb-1' },
+                                    h('div', { className: 'flex flex-wrap gap-1' },
+                                        h('span', { className: 'text-xs font-bold text-sky-600 bg-sky-50 px-2 py-0.5 rounded-full' }, `r/${comment.sub}`),
+                                        h('span', { className: 'text-xs font-bold text-purple-600 bg-purple-50 px-2 py-0.5 rounded-full' }, `${comment.yearsAgo}y`)
+                                    ),
+                                    h('span', { className: 'text-xs font-bold text-green-600 bg-green-50 px-2 py-0.5 rounded-full' }, `↑${comment.score}`)
+                                ),
+                                h('p', { className: 'text-xs text-gray-400 mb-1' }, comment.postDate),
+                                h('a', {
+                                    href: comment.postUrl,
+                                    target: '_blank',
+                                    className: 'text-xs text-gray-700 hover:text-sky-600 font-semibold line-clamp-2 mb-2 block'
+                                }, comment.postTitle),
+                                h('p', {
+                                    className: 'text-gray-800 text-sm leading-relaxed mb-2 whitespace-pre-wrap',
+                                    style: { wordBreak: 'break-word' }
+                                }, comment.body),
+                                h('div', { className: 'flex justify-between items-center pt-2 border-t' },
+                                    h('span', { className: 'text-xs font-bold text-gray-500' }, `— u/${comment.author}`),
+                                    h('button', {
+                                        onClick: () => sendToWhatsApp(comment),
+                                        className: 'text-xs bg-green-600 text-white px-2 py-1 rounded-lg hover:bg-green-700 font-bold'
+                                    }, '📱')
+                                )
+                            )
+                        )
+                    ),
+
+                    // Action bar
+                    h('div', { className: 'flex gap-2' },
+                        h('button', {
+                            onClick: handleShuffle,
+                            disabled: loading,
+                            className: 'flex-1 bg-gradient-to-r from-sky-500 to-blue-500 text-white py-3 rounded-xl font-bold hover:from-sky-600 hover:to-blue-600 disabled:opacity-40 transition text-sm'
+                        }, '🔀 Shuffle 50 More'),
+                        h('button', {
+                            onClick: () => setShowSettings(true),
+                            className: 'px-5 bg-gray-100 py-3 rounded-xl hover:bg-gray-200 font-bold text-sm'
+                        }, '⚙️')
+                    ),
+                    h('p', { className: 'text-center text-xs text-gray-400 mt-2' },
+                        `Showing ${comments.length} of ${postStats.reduce((a, s) => a + s.count, 0)} total comments`
+                    )
+
+                ) :
+
+                // Empty / ready state
+                h('div', { className: 'bg-white rounded-xl shadow-xl p-10 text-center' },
+                    h('div', { className: 'text-5xl mb-3' }, '🎯'),
+                    h('p', { className: 'text-gray-600 mb-2 font-bold' }, 'Ready to fetch!'),
+                    h('button', {
+                        onClick: handleShuffle,
+                        className: 'bg-gradient-to-r from-sky-500 to-blue-500 text-white px-6 py-3 rounded-xl font-bold'
+                    }, '🎯 Fetch Comments')
+                )
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('app'));
+        root.render(React.createElement(App));
+    </script>
+</body>
+</html>
